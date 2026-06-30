@@ -285,6 +285,199 @@ SELECT DISTINCT
     CURRENT_TIMESTAMP AS loaded_timestamp
 FROM raw.transactions;
 
+CREATE SCHEMA IF NOT EXISTS audit;
+
+CREATE TABLE IF NOT EXISTS audit.validation_log (
+    log_id           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    layer            VARCHAR(50),     -- raw, staging, dim, fact
+    table_name       VARCHAR(100),    -- which table was checked
+    check_name       VARCHAR(100),    -- what was being validated
+    records_checked  INTEGER,         -- total rows in the table at time of check
+    records_failed   INTEGER,         -- rows that failed the check
+    severity         VARCHAR(20),     -- ERROR, WARNING, INFO
+    notes            TEXT,            -- human readable explanation
+    checked_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Validation: products
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.products_master', 'null_product_id',
+    COUNT(*), COUNT(*) FILTER (WHERE product_id IS NULL),
+    'ERROR', 'Products with no product_id after load'
+FROM staging.products_master;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.products_master', 'null_product_name',
+    COUNT(*), COUNT(*) FILTER (WHERE product_name IS NULL),
+    'ERROR', 'Products with no product_name after load'
+FROM staging.products_master;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.products_master', 'negative_unit_price',
+    COUNT(*), COUNT(*) FILTER (WHERE unit_price_ghs < 0),
+    'ERROR', 'Products with a negative price'
+FROM staging.products_master;
+
+-- Validation: stores
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.stores_master', 'null_store_id',
+    COUNT(*), COUNT(*) FILTER (WHERE store_id IS NULL),
+    'ERROR', 'Stores with no store_id after load'
+FROM staging.stores_master;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.stores_master', 'null_city',
+    COUNT(*), COUNT(*) FILTER (WHERE city IS NULL),
+    'WARNING', 'Stores with no city'
+FROM staging.stores_master;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.stores_master', 'null_region',
+    COUNT(*), COUNT(*) FILTER (WHERE region IS NULL),
+    'WARNING', 'Stores with no region'
+FROM staging.stores_master;
+
+-- Validation: staff
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.staff_master', 'null_staff_id',
+    COUNT(*), COUNT(*) FILTER (WHERE staff_id IS NULL),
+    'ERROR', 'Staff rows with no staff_id'
+FROM staging.staff_master;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.staff_master', 'null_date_hired',
+    COUNT(*), COUNT(*) FILTER (WHERE date_hired IS NULL),
+    'WARNING', 'Staff rows where date_hired could not be parsed'
+FROM staging.staff_master;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.staff_master', 'invalid_employment_status',
+    COUNT(*), COUNT(*) FILTER (WHERE employment_status NOT IN ('Active', 'Inactive', 'Suspended')),
+    'ERROR', 'Staff with employment_status outside allowed values'
+FROM staging.staff_master;
+
+-- Validation: managers
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.managers_master', 'null_manager_id',
+    COUNT(*), COUNT(*) FILTER (WHERE manager_id IS NULL),
+    'ERROR', 'Managers with no manager_id'
+FROM staging.managers_master;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.managers_master', 'null_store_id',
+    COUNT(*), COUNT(*) FILTER (WHERE store_id IS NULL),
+    'ERROR', 'Managers with no store assigned'
+FROM staging.managers_master;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.managers_master', 'null_date_appointed',
+    COUNT(*), COUNT(*) FILTER (WHERE date_appointed IS NULL),
+    'WARNING', 'Managers where date_appointed could not be parsed'
+FROM staging.managers_master;
+
+-- Validation: transactions
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.transactions', 'null_transaction_timestamp',
+    COUNT(*), COUNT(*) FILTER (WHERE transaction_timestamp IS NULL),
+    'ERROR', 'Rows where timestamp could not be parsed from raw'
+FROM staging.transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.transactions', 'null_receipt_no',
+    COUNT(*), COUNT(*) FILTER (WHERE receipt_no IS NULL),
+    'ERROR', 'Transactions with no receipt number'
+FROM staging.transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.transactions', 'null_quantity',
+    COUNT(*), COUNT(*) FILTER (WHERE quantity IS NULL),
+    'ERROR', 'Rows where quantity could not be cast to integer'
+FROM staging.transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.transactions', 'invalid_payment_method',
+    COUNT(*), COUNT(*) FILTER (WHERE payment_method NOT IN ('Cash', 'Card', 'Mobile Money')),
+    'ERROR', 'Payment method outside allowed values'
+FROM staging.transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'staging', 'staging.transactions', 'missing_customer_phone',
+    COUNT(*), COUNT(*) FILTER (WHERE customer_phone IS NULL),
+    'INFO', 'Transactions with no customer phone (optional field)'
+FROM staging.transactions;
+
+-- Validation: dim.products
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'dim', 'dim.products', 'row_count_vs_staging',
+    (SELECT COUNT(*) FROM staging.products_master),
+    ABS(COUNT(*) - (SELECT COUNT(*) FROM staging.products_master)),
+    'WARNING', 'Row count mismatch between staging and dim.products'
+FROM dim.products;
+
+-- Validation: dim.staff
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'dim', 'dim.staff', 'null_store_id',
+    COUNT(*), COUNT(*) FILTER (WHERE store_id IS NULL),
+    'ERROR', 'Staff in dim with no store assigned'
+FROM dim.staff;
+
+-- Validation: dim.stores
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'dim', 'dim.stores', 'null_region',
+    COUNT(*), COUNT(*) FILTER (WHERE region IS NULL),
+    'WARNING', 'Stores in dim with no region'
+FROM dim.stores;
+
+-- Validation: dim.masters
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'dim', 'dim.masters', 'null_email',
+    COUNT(*), COUNT(*) FILTER (WHERE email IS NULL),
+    'INFO', 'Managers with no email on record'
+FROM dim.masters;
+
+-- Validation: fact.transactions
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'fact', 'fact.transactions', 'unmatched_staff',
+    COUNT(*), COUNT(*) FILTER (WHERE staff_id IS NULL),
+    'WARNING', 'Transactions where staff_name had no match in dim.staff'
+FROM fact.transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'fact', 'fact.transactions', 'unmatched_product',
+    COUNT(*), COUNT(*) FILTER (WHERE product_id IS NULL),
+    'WARNING', 'Transactions where product_sold had no match in dim.products'
+FROM fact.transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'fact', 'fact.transactions', 'null_total_amount',
+    COUNT(*), COUNT(*) FILTER (WHERE total_amount_ghs IS NULL),
+    'ERROR', 'Transactions with no total amount (likely missing product match)'
+FROM fact.transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'fact', 'fact.transactions', 'zero_or_negative_total',
+    COUNT(*), COUNT(*) FILTER (WHERE total_amount_ghs <= 0),
+    'ERROR', 'Transactions with zero or negative total amount'
+FROM fact.transactions;
+
+
+-- View all failures
+SELECT
+    layer,
+    table_name,
+    check_name,
+    records_checked,
+    records_failed,
+    severity,
+    notes,
+    checked_at
+FROM audit.validation_log
+WHERE records_failed > 0
+ORDER BY
+    CASE severity WHEN 'ERROR' THEN 1 WHEN 'WARNING' THEN 2 ELSE 3 END,
+    checked_at;
+
+
 
 CREATE TABLE IF NOT EXISTS dim.products (
     product_id      VARCHAR(50) PRIMARY KEY,
