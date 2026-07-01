@@ -25,10 +25,12 @@ logging.basicConfig(
 
 
 # Config
-SERVICE_ACCOUNT_FILE = "service_account.json"
-SCOPES               = ["https://www.googleapis.com/auth/drive.readonly"]
-FOLDER_SALES         = "1sUkcP0L1C_AVZ9Tmtt9vr5NAWQUXFIlC"
-FOLDER_REFERENCE     = "19O0ryibjPL8q6Tni5FcT-0FEpkp7ebap"
+
+load_dotenv()
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE")
+SCOPES = [os.getenv("SCOPES")]  # convert string → list
+FOLDER_SALES = os.getenv("FOLDER_SALES")
+FOLDER_REFERENCE = os.getenv("FOLDER_REFERENCE")
 
 TABLE_MAPPING = {
     "Stores_Master":   "ref_store_manager",
@@ -40,8 +42,6 @@ TABLE_MAPPING = {
 
 # Step 1 — Load environment variables
 def get_env_vars() -> dict:
-    load_dotenv()
-
     config = {
         "DB_USER":     os.getenv("DB_USER"),
         "DB_PASSWORD": os.getenv("DB_PASSWORD"),
@@ -49,12 +49,6 @@ def get_env_vars() -> dict:
         "DB_PORT":     os.getenv("DB_PORT"),
         "DB_NAME":     os.getenv("DB_NAME"),
     }
-
-    missing = [k for k, v in config.items() if not v]
-    if missing:
-        raise ValueError(f"Missing environment variables: {missing}")
-
-    logging.info("Environment variables loaded successfully.")
     return config
 
 
