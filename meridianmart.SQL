@@ -1,16 +1,12 @@
+-- SCHEMA CREATION
 CREATE SCHEMA IF NOT EXISTS raw;
 CREATE SCHEMA IF NOT EXISTS staging;
-CREATE SCHEMA IF NOT EXISTS dim;
-CREATE SCHEMA IF NOT EXISTS fact;
+CREATE SCHEMA IF NOT EXISTS mart;
+CREATE SCHEMA IF NOT EXISTS audit;
 
-DROP SCHEMA RAW CASCADE;
-DROP SCHEMA staging CASCADE;
-DROP SCHEMA dim CASCADE;
-DROP SCHEMA fact CASCADE;
+-- RAW LAYER: Unprocessed landing data
 
-
-
-
+-- Transaction data 
 CREATE TABLE raw.transactions (
     timestamp                        TEXT,
     store_id                         TEXT,
@@ -24,8 +20,7 @@ CREATE TABLE raw.transactions (
     load_timestamp                   TEXT    -- when pipeline loaded it
 );
 
-
-
+-- Reference: Store managers
 CREATE TABLE raw.ref_managers (
     manager_id        TEXT,
     full_name         TEXT,
@@ -38,7 +33,7 @@ CREATE TABLE raw.ref_managers (
     load_timestamp    TEXT
 );
 
- 
+-- Reference: Product catalog
 CREATE TABLE raw.ref_product_manager (
     product_id      TEXT,
     product_name    TEXT,
@@ -49,6 +44,7 @@ CREATE TABLE raw.ref_product_manager (
     load_timestamp  TEXT
 );
 
+-- Reference: Staff information
 CREATE TABLE raw.ref_staff_manager (
     staff_id          TEXT,
     full_name         TEXT,
@@ -60,6 +56,8 @@ CREATE TABLE raw.ref_staff_manager (
     employment_status TEXT,
     load_timestamp    TEXT
 );
+
+-- Reference: Store locations
 CREATE TABLE raw.ref_store_manager (
     store_id       TEXT,
     city           TEXT,
@@ -67,9 +65,9 @@ CREATE TABLE raw.ref_store_manager (
     load_timestamp TEXT
 );
 
+-- STAGING LAYER: Cleaned and typed master data
 
-
-
+-- Master product catalog
 CREATE TABLE staging.products_master (
     product_id      VARCHAR(50)  NOT NULL,
     product_name    VARCHAR(255) NOT NULL,
@@ -82,7 +80,6 @@ CREATE TABLE staging.products_master (
     CONSTRAINT pk_products_master PRIMARY KEY (product_id)
 );
 
-
 INSERT INTO staging.products_master (
     product_id,
     product_name,
@@ -90,7 +87,6 @@ INSERT INTO staging.products_master (
     unit_price_ghs,
     last_updated,
     updated_by,
-   
     load_timestamp
 )
 SELECT DISTINCT
@@ -98,15 +94,12 @@ SELECT DISTINCT
     NULLIF(product_name, '') AS product_name,
     NULLIF(category, '') AS category,
     NULLIF(unit_price_ghs, '')::DECIMAL(10,2) AS unit_price_ghs,
-
-    CURRENT_DATE AS last_updated,  
-
+    CURRENT_DATE AS last_updated,
     updated_by,
-   
     CURRENT_TIMESTAMP AS load_timestamp
-FROM raw.ref_product_master;
+FROM raw.ref_product_manager;
 
-
+-- Master store locations
 CREATE TABLE staging.stores_master (
     store_id         VARCHAR(50)  NOT NULL,
     city             VARCHAR(255) NOT NULL,
@@ -129,7 +122,7 @@ SELECT DISTINCT
     CURRENT_TIMESTAMP AS loaded_timestamp
 FROM raw.ref_store_manager;
 
-
+-- Master staff 
 CREATE TABLE staging.staff_master (
     staff_id          VARCHAR(50)  NOT NULL,
     full_name         VARCHAR(255) NOT NULL,
@@ -142,12 +135,18 @@ CREATE TABLE staging.staff_master (
     loaded_timestamp  TIMESTAMP NOT NULL,
 
     CONSTRAINT pk_staff_master PRIMARY KEY (staff_id),
-
     CONSTRAINT fk_staff_master_store
         FOREIGN KEY (store_id)
         REFERENCES staging.stores_master (store_id)
 );
 
+-- Load staff 
+WITH city_map AS (
+    SELECT DISTINCT
+        city,
+        store_id
+    FROM staging.stores_master
+)
 INSERT INTO staging.staff_master (
     staff_id,
     full_name,
@@ -160,26 +159,26 @@ INSERT INTO staging.staff_master (
     loaded_timestamp
 )
 SELECT DISTINCT
-    NULLIF(staff_id, '') AS staff_id,
-    NULLIF(full_name, '') AS full_name,
-    NULLIF(role, '') AS role,
-    NULLIF(store_id, '') AS store_id,
-    NULLIF(store_city, '') AS store_city,
-    NULLIF(phone_number, '') AS phone_number,
-
+    NULLIF(s.staff_id, '') AS staff_id,
+    NULLIF(s.full_name, '') AS full_name,
+    NULLIF(s.role, '') AS role,
+    NULLIF(s.store_city, '') AS store_city,
+    NULLIF(s.phone_number, '') AS phone_number,
     CASE
-        WHEN date_hired LIKE '%/%/%'
-            THEN to_date(date_hired, 'MM/DD/YYYY')
-        WHEN date_hired LIKE '%-%-%'
-            THEN date_hired::date
+        WHEN s.date_hired LIKE '%/%/%'
+            THEN to_date(s.date_hired, 'MM/DD/YYYY')
+        WHEN s.date_hired LIKE '%-%-%'
+            THEN s.date_hired::date
         ELSE NULL
     END AS date_hired,
-
-    NULLIF(employment_status, '') AS employment_status,
+    NULLIF(s.employment_status, '') AS employment_status,
     CURRENT_TIMESTAMP AS loaded_timestamp
-FROM raw.ref_staff_manager;
+FROM raw.ref_staff_manager s
+LEFT JOIN city_map cm
+    ON s.store_city = cm.city;
 
-CREATE TABLE staging.managers_master (
+-- Master managers 
+CREATE TABLE IF NOT EXISTS staging.managers_master (
     manager_id        VARCHAR(50)  NOT NULL,
     full_name         VARCHAR(255) NOT NULL,
     role              VARCHAR(100) NOT NULL,
@@ -191,12 +190,78 @@ CREATE TABLE staging.managers_master (
     loaded_timestamp  TIMESTAMP NOT NULL,
 
     CONSTRAINT pk_managers_master PRIMARY KEY (manager_id),
-
     CONSTRAINT fk_managers_master_store
         FOREIGN KEY (store_id)
         REFERENCES staging.stores_master (store_id)
 );
 
+-- Load managers 
+WITH raw_clean AS (
+    SELECT DISTINCT ON (manager_id)
+        manager_id,
+        full_name,
+        role,
+        phone_number,
+        email,
+        date_appointed,
+        reports_to,
+        store_id AS raw_store_id
+    FROM raw.ref_managers
+    ORDER BY manager_id
+),
+extracted_codes AS (
+    SELECT
+        manager_id,
+        full_name,
+        role,
+        phone_number,
+        email,
+        date_appointed,
+        reports_to,
+        raw_store_id,
+        CASE
+            WHEN LOWER(email) ~ 's[0-9]{3}'
+                THEN LOWER(regexp_replace(email, '.*s([0-9]{3}).*', '\1'))
+            ELSE NULL
+        END AS store_code
+    FROM raw_clean
+),
+store_code_map AS (
+    SELECT
+        store_id,
+        LOWER(regexp_replace(store_id, '.*([0-9]{3}).*', '\1')) AS store_code
+    FROM staging.stores_master
+),
+region_map AS (
+    SELECT
+        region,
+        store_id
+    FROM staging.stores_master
+),
+final_rows AS (
+    SELECT DISTINCT ON (e.manager_id)
+        e.manager_id,
+        e.full_name,
+        e.role,
+        COALESCE(scm.store_id, rm.store_id) AS store_id,
+        e.phone_number,
+        e.email,
+        CASE
+            WHEN e.date_appointed LIKE '%/%/%'
+                THEN to_date(e.date_appointed, 'MM/DD/YYYY')
+            WHEN e.date_appointed LIKE '%-%-%'
+                THEN e.date_appointed::date
+            ELSE NULL
+        END AS date_appointed,
+        e.reports_to,
+        CURRENT_TIMESTAMP AS loaded_timestamp
+    FROM extracted_codes e
+    LEFT JOIN store_code_map scm
+        ON e.store_code = scm.store_code
+    LEFT JOIN region_map rm
+        ON e.raw_store_id = rm.region
+    ORDER BY e.manager_id
+)
 INSERT INTO staging.managers_master (
     manager_id,
     full_name,
@@ -206,32 +271,31 @@ INSERT INTO staging.managers_master (
     email,
     date_appointed,
     reports_to,
-    
     loaded_timestamp
 )
-SELECT DISTINCT 
-    NULLIF(manager_id, '') AS manager_id,
-    NULLIF(full_name, '') AS full_name,
-    NULLIF(role, '') AS role,
-    NULLIF(store_id, '') AS store_id,
-    NULLIF(phone_number, '') AS phone_number,
-    NULLIF(email, '') AS email,
+SELECT
+    manager_id,
+    full_name,
+    role,
+    store_id,
+    phone_number,
+    email,
+    date_appointed,
+    reports_to,
+    loaded_timestamp
+FROM final_rows
+ON CONFLICT (manager_id) DO UPDATE SET
+    full_name = EXCLUDED.full_name,
+    role = EXCLUDED.role,
+    store_id = EXCLUDED.store_id,
+    phone_number = EXCLUDED.phone_number,
+    email = EXCLUDED.email,
+    date_appointed = EXCLUDED.date_appointed,
+    reports_to = EXCLUDED.reports_to,
+    loaded_timestamp = EXCLUDED.loaded_timestamp;
 
-    CASE
-        WHEN date_appointed LIKE '%/%/%'
-            THEN to_date(date_appointed, 'MM/DD/YYYY')
-        WHEN date_appointed LIKE '%-%-%'
-            THEN date_appointed::date
-        ELSE NULL
-    END AS date_appointed,
-
-    NULLIF(reports_to, '') AS reports_to,
-    
-    CURRENT_TIMESTAMP AS loaded_timestamp
-FROM raw.ref_managers;
-
-
-CREATE TABLE staging.transactions (
+-- Staging transactions 
+CREATE TABLE IF NOT EXISTS staging.transactions (
     transaction_timestamp   TIMESTAMP NOT NULL,
     store_id                VARCHAR(50) NOT NULL,
     staff_name              VARCHAR(255) NOT NULL,
@@ -239,7 +303,9 @@ CREATE TABLE staging.transactions (
     customer_phone          VARCHAR(50),
     product_sold            VARCHAR(255) NOT NULL,
     quantity                INTEGER NOT NULL CHECK (quantity > 0),
-    payment_method          VARCHAR(50) NOT NULL CHECK (payment_method IN ('Cash', 'Card', 'Mobile Money')),
+    payment_method          VARCHAR(50) NOT NULL CHECK (
+        payment_method IN ('Cash', 'Card', 'Mobile Money')
+    ),
     source_file             VARCHAR(255) NOT NULL,
     loaded_timestamp        TIMESTAMP NOT NULL,
 
@@ -248,6 +314,7 @@ CREATE TABLE staging.transactions (
         REFERENCES staging.stores_master (store_id)
 );
 
+-- Load transactions with timestamp parsing and payment standardization
 INSERT INTO staging.transactions (
     transaction_timestamp,
     store_id,
@@ -268,38 +335,43 @@ SELECT DISTINCT
             THEN timestamp::timestamp
         ELSE NULL
     END AS transaction_timestamp,
-
     NULLIF(store_id, '') AS store_id,
     NULLIF(staff_name, '') AS staff_name,
     NULLIF(receipt_no, '') AS receipt_no,
     NULLIF(customer_phone_number_optional, '') AS customer_phone,
     NULLIF(product_sold, '') AS product_sold,
-
     CASE
         WHEN quantity ~ '^[0-9]+$' THEN quantity::integer
         ELSE NULL
     END AS quantity,
-
-    NULLIF(payment_method, '') AS payment_method,
+    CASE
+        WHEN LOWER(payment_method) IN ('cash') THEN 'Cash'
+        WHEN LOWER(payment_method) IN ('card') THEN 'Card'
+        WHEN LOWER(payment_method) IN ('mobile money', 'momo', 'mo mo', 'mobile_money') THEN 'Mobile Money'
+        WHEN LOWER(payment_method) = 'transfer' THEN 'Mobile Money'
+    END AS payment_method,
     source_file,
     CURRENT_TIMESTAMP AS loaded_timestamp
 FROM raw.transactions;
 
-CREATE SCHEMA IF NOT EXISTS audit;
+-- AUDIT LAYER: Data quality validation
 
+-- Central validation log
 CREATE TABLE IF NOT EXISTS audit.validation_log (
     log_id           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    layer            VARCHAR(50),     -- raw, staging, dim, fact
-    table_name       VARCHAR(100),    -- which table was checked
-    check_name       VARCHAR(100),    -- what was being validated
-    records_checked  INTEGER,         -- total rows in the table at time of check
-    records_failed   INTEGER,         -- rows that failed the check
+    layer            VARCHAR(50),
+    table_name       VARCHAR(100),
+    check_name       VARCHAR(100),
+    records_checked  INTEGER,
+    records_failed   INTEGER,
     severity         VARCHAR(20),     -- ERROR, WARNING, INFO
-    notes            TEXT,            -- human readable explanation
+    notes            TEXT,
     checked_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Validation: products
+-- STAGING VALIDATION CHECKS
+
+-- Products validation
 INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
 SELECT 'staging', 'staging.products_master', 'null_product_id',
     COUNT(*), COUNT(*) FILTER (WHERE product_id IS NULL),
@@ -318,7 +390,7 @@ SELECT 'staging', 'staging.products_master', 'negative_unit_price',
     'ERROR', 'Products with a negative price'
 FROM staging.products_master;
 
--- Validation: stores
+-- Stores validation
 INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
 SELECT 'staging', 'staging.stores_master', 'null_store_id',
     COUNT(*), COUNT(*) FILTER (WHERE store_id IS NULL),
@@ -337,7 +409,7 @@ SELECT 'staging', 'staging.stores_master', 'null_region',
     'WARNING', 'Stores with no region'
 FROM staging.stores_master;
 
--- Validation: staff
+-- Staff validation
 INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
 SELECT 'staging', 'staging.staff_master', 'null_staff_id',
     COUNT(*), COUNT(*) FILTER (WHERE staff_id IS NULL),
@@ -356,7 +428,7 @@ SELECT 'staging', 'staging.staff_master', 'invalid_employment_status',
     'ERROR', 'Staff with employment_status outside allowed values'
 FROM staging.staff_master;
 
--- Validation: managers
+-- Managers validation
 INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
 SELECT 'staging', 'staging.managers_master', 'null_manager_id',
     COUNT(*), COUNT(*) FILTER (WHERE manager_id IS NULL),
@@ -375,7 +447,7 @@ SELECT 'staging', 'staging.managers_master', 'null_date_appointed',
     'WARNING', 'Managers where date_appointed could not be parsed'
 FROM staging.managers_master;
 
--- Validation: transactions
+-- Transactions validation
 INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
 SELECT 'staging', 'staging.transactions', 'null_transaction_timestamp',
     COUNT(*), COUNT(*) FILTER (WHERE transaction_timestamp IS NULL),
@@ -406,80 +478,10 @@ SELECT 'staging', 'staging.transactions', 'missing_customer_phone',
     'INFO', 'Transactions with no customer phone (optional field)'
 FROM staging.transactions;
 
--- Validation: dim.products
-INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
-SELECT 'dim', 'dim.products', 'row_count_vs_staging',
-    (SELECT COUNT(*) FROM staging.products_master),
-    ABS(COUNT(*) - (SELECT COUNT(*) FROM staging.products_master)),
-    'WARNING', 'Row count mismatch between staging and dim.products'
-FROM dim.products;
+-- MART LAYER: Analytics-ready dimensional model
 
--- Validation: dim.staff
-INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
-SELECT 'dim', 'dim.staff', 'null_store_id',
-    COUNT(*), COUNT(*) FILTER (WHERE store_id IS NULL),
-    'ERROR', 'Staff in dim with no store assigned'
-FROM dim.staff;
-
--- Validation: dim.stores
-INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
-SELECT 'dim', 'dim.stores', 'null_region',
-    COUNT(*), COUNT(*) FILTER (WHERE region IS NULL),
-    'WARNING', 'Stores in dim with no region'
-FROM dim.stores;
-
--- Validation: dim.masters
-INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
-SELECT 'dim', 'dim.masters', 'null_email',
-    COUNT(*), COUNT(*) FILTER (WHERE email IS NULL),
-    'INFO', 'Managers with no email on record'
-FROM dim.masters;
-
--- Validation: fact.transactions
-INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
-SELECT 'fact', 'fact.transactions', 'unmatched_staff',
-    COUNT(*), COUNT(*) FILTER (WHERE staff_id IS NULL),
-    'WARNING', 'Transactions where staff_name had no match in dim.staff'
-FROM fact.transactions;
-
-INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
-SELECT 'fact', 'fact.transactions', 'unmatched_product',
-    COUNT(*), COUNT(*) FILTER (WHERE product_id IS NULL),
-    'WARNING', 'Transactions where product_sold had no match in dim.products'
-FROM fact.transactions;
-
-INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
-SELECT 'fact', 'fact.transactions', 'null_total_amount',
-    COUNT(*), COUNT(*) FILTER (WHERE total_amount_ghs IS NULL),
-    'ERROR', 'Transactions with no total amount (likely missing product match)'
-FROM fact.transactions;
-
-INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
-SELECT 'fact', 'fact.transactions', 'zero_or_negative_total',
-    COUNT(*), COUNT(*) FILTER (WHERE total_amount_ghs <= 0),
-    'ERROR', 'Transactions with zero or negative total amount'
-FROM fact.transactions;
-
-
--- View all failures
-SELECT
-    layer,
-    table_name,
-    check_name,
-    records_checked,
-    records_failed,
-    severity,
-    notes,
-    checked_at
-FROM audit.validation_log
-WHERE records_failed > 0
-ORDER BY
-    CASE severity WHEN 'ERROR' THEN 1 WHEN 'WARNING' THEN 2 ELSE 3 END,
-    checked_at;
-
-
-
-CREATE TABLE IF NOT EXISTS dim.products (
+-- Product dimension
+CREATE TABLE IF NOT EXISTS mart.dim_products (
     product_id      VARCHAR(50) PRIMARY KEY,
     product_name    VARCHAR(255),
     category        VARCHAR(100),
@@ -488,7 +490,7 @@ CREATE TABLE IF NOT EXISTS dim.products (
     updated_by      VARCHAR(255)
 );
 
-INSERT INTO dim.products (
+INSERT INTO mart.dim_products (
     product_id,
     product_name,
     category,
@@ -506,11 +508,12 @@ SELECT
 FROM staging.products_master s
 WHERE NOT EXISTS (
     SELECT 1
-    FROM dim.products d
+    FROM mart.dim_products d
     WHERE d.product_id = s.product_id
 );
 
-CREATE TABLE IF NOT EXISTS dim.staff (
+-- Staff dimension
+CREATE TABLE IF NOT EXISTS mart.dim_staff (
     staff_id          VARCHAR(50) PRIMARY KEY,
     full_name         VARCHAR(255),
     role              VARCHAR(100),
@@ -521,7 +524,7 @@ CREATE TABLE IF NOT EXISTS dim.staff (
     employment_status VARCHAR(50)
 );
 
-INSERT INTO dim.staff (
+INSERT INTO mart.dim_staff (
     staff_id,
     full_name,
     role,
@@ -543,17 +546,18 @@ SELECT
 FROM staging.staff_master s
 WHERE NOT EXISTS (
     SELECT 1
-    FROM dim.staff d
+    FROM mart.dim_staff d
     WHERE d.staff_id = s.staff_id
 );
 
-CREATE TABLE IF NOT EXISTS dim.stores (
+-- Store dimension
+CREATE TABLE IF NOT EXISTS mart.dim_stores (
     store_id VARCHAR(50) PRIMARY KEY,
     city     VARCHAR(255),
     region   VARCHAR(100)
 );
 
-INSERT INTO dim.stores (
+INSERT INTO mart.dim_stores (
     store_id,
     city,
     region
@@ -565,11 +569,12 @@ SELECT
 FROM staging.stores_master s
 WHERE NOT EXISTS (
     SELECT 1
-    FROM dim.stores d
+    FROM mart.dim_stores d
     WHERE d.store_id = s.store_id
 );
 
-CREATE TABLE IF NOT EXISTS dim.masters (
+-- Manager dimension
+CREATE TABLE IF NOT EXISTS mart.dim_masters (
     master_id      VARCHAR(50) PRIMARY KEY,
     full_name      VARCHAR(255),
     role           VARCHAR(100),
@@ -580,7 +585,7 @@ CREATE TABLE IF NOT EXISTS dim.masters (
     reports_to     VARCHAR(50)
 );
 
-INSERT INTO dim.masters (
+INSERT INTO mart.dim_masters (
     master_id,
     full_name,
     role,
@@ -599,14 +604,15 @@ SELECT
     s.email,
     s.date_appointed,
     s.reports_to
-FROM staging.managers_master s   
+FROM staging.managers_master s
 WHERE NOT EXISTS (
     SELECT 1
-    FROM dim.masters d
+    FROM mart.dim_masters d
     WHERE d.master_id = s.manager_id
 );
 
-CREATE TABLE IF NOT EXISTS dim.date (
+-- Date dimension
+CREATE TABLE IF NOT EXISTS mart.dim_date (
     date_key        DATE PRIMARY KEY,
     year            INT,
     month           INT,
@@ -615,7 +621,7 @@ CREATE TABLE IF NOT EXISTS dim.date (
     weekday_number  INT
 );
 
-INSERT INTO dim.date (
+INSERT INTO mart.dim_date (
     date_key,
     year,
     month,
@@ -634,11 +640,12 @@ FROM staging.transactions t
 WHERE t.transaction_timestamp IS NOT NULL
   AND NOT EXISTS (
         SELECT 1
-        FROM dim.date d
+        FROM mart.dim_date d
         WHERE d.date_key = t.transaction_timestamp::date
   );
 
-CREATE TABLE IF NOT EXISTS fact.transactions (
+-- Fact transactions with calculated amounts
+CREATE TABLE IF NOT EXISTS mart.fact_transactions (
     transaction_key      INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     receipt_no           VARCHAR(100),
     sale_timestamp       TIMESTAMP,
@@ -653,7 +660,8 @@ CREATE TABLE IF NOT EXISTS fact.transactions (
     customer_phone       VARCHAR(50)
 );
 
-INSERT INTO fact.transactions (
+-- Load fact table 
+INSERT INTO mart.fact_transactions (
     receipt_no,
     sale_timestamp,
     date_key,
@@ -671,24 +679,89 @@ SELECT
     t.transaction_timestamp AS sale_timestamp,
     t.transaction_timestamp::date AS date_key,
     t.store_id,
-
     s.staff_id,
     p.product_id,
-
     t.quantity,
     p.unit_price_ghs,
     t.quantity * p.unit_price_ghs AS total_amount_ghs,
     t.payment_method,
     t.customer_phone
 FROM staging.transactions t
-LEFT JOIN dim.staff s
+LEFT JOIN mart.dim_staff s
     ON LOWER(t.staff_name) = LOWER(s.full_name)
-LEFT JOIN dim.products p
+LEFT JOIN mart.dim_products p
     ON LOWER(t.product_sold) = LOWER(p.product_name)
 WHERE NOT EXISTS (
     SELECT 1
-    FROM fact.transactions f
+    FROM mart.fact_transactions f
     WHERE f.receipt_no = t.receipt_no
-      AND f.product_id = p.product_id
+      AND f.product_id IS NOT DISTINCT FROM p.product_id
       AND f.sale_timestamp = t.transaction_timestamp
 );
+
+-- MART VALIDATION CHECKS
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'mart', 'mart.dim_products', 'row_count_vs_staging',
+    (SELECT COUNT(*) FROM staging.products_master),
+    ABS(COUNT(*) - (SELECT COUNT(*) FROM staging.products_master)),
+    'WARNING', 'Row count mismatch between staging and mart.dim_products'
+FROM mart.dim_products;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'mart', 'mart.dim_staff', 'null_store_id',
+    COUNT(*), COUNT(*) FILTER (WHERE store_id IS NULL),
+    'ERROR', 'Staff in mart with no store assigned'
+FROM mart.dim_staff;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'mart', 'mart.dim_stores', 'null_region',
+    COUNT(*), COUNT(*) FILTER (WHERE region IS NULL),
+    'WARNING', 'Stores in mart with no region'
+FROM mart.dim_stores;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'mart', 'mart.dim_masters', 'null_email',
+    COUNT(*), COUNT(*) FILTER (WHERE email IS NULL),
+    'INFO', 'Managers with no email on record'
+FROM mart.dim_masters;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'mart', 'mart.fact_transactions', 'unmatched_staff',
+    COUNT(*), COUNT(*) FILTER (WHERE staff_id IS NULL),
+    'WARNING', 'Transactions where staff_name had no match in mart.dim_staff'
+FROM mart.fact_transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'mart', 'mart.fact_transactions', 'unmatched_product',
+    COUNT(*), COUNT(*) FILTER (WHERE product_id IS NULL),
+    'WARNING', 'Transactions where product_sold had no match in mart.dim_products'
+FROM mart.fact_transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'mart', 'mart.fact_transactions', 'null_total_amount',
+    COUNT(*), COUNT(*) FILTER (WHERE total_amount_ghs IS NULL),
+    'ERROR', 'Transactions with no total amount (likely missing product match)'
+FROM mart.fact_transactions;
+
+INSERT INTO audit.validation_log (layer, table_name, check_name, records_checked, records_failed, severity, notes)
+SELECT 'mart', 'mart.fact_transactions', 'zero_or_negative_total',
+    COUNT(*), COUNT(*) FILTER (WHERE total_amount_ghs <= 0),
+    'ERROR', 'Transactions with zero or negative total amount'
+FROM mart.fact_transactions;
+
+-- Validation report: View all failures
+SELECT
+    layer,
+    table_name,
+    check_name,
+    records_checked,
+    records_failed,
+    severity,
+    notes,
+    checked_at
+FROM audit.validation_log
+WHERE records_failed > 0
+ORDER BY
+    CASE severity WHEN 'ERROR' THEN 1 WHEN 'WARNING' THEN 2 ELSE 3 END,
+    checked_at;
